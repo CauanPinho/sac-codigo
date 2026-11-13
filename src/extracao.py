@@ -6,16 +6,38 @@ from collections import Counter
 from dataclasses import dataclass
 
 import pdfplumber
+import pandas as pd
 
 ROTULOS = {
+    "ementario": ("ementario",),
+    "disciplina": ("disciplina",),
+    "curso": ("curso",),
     "ementa": ("ementa",),
     "carga": ("carga horaria", "c.h.", "ch:"),
-    "bibliografia": ("bibliografia", "referencias"),
     "objetivo": ("objetivo",),
+    "bibliografia": ("bibliografia", "referencias"),
     "prerequisito": ("pre-requisito", "prerequisito"),
 }
 
+TODOS_ROTULOS = {
+    "disciplina", "curso", "ementa", "carga",
+    "objetivo", "bibliografia", "prerequisito",
+}
+
 PADRAO_HIFEN = re.compile(r"-\n(?=[a-zà-ÿ])")
+
+PADRAO_ANEXO = re.compile(r"\bANEXO\s+([IVXLCDM]+|\d+)\b", re.IGNORECASE)
+
+PADRAO_VALOR_DISCIPLINA = re.compile(
+    r"^(?:(\d{1,2})\s*[º°]\s+)?(.+?)\s+([A-ZÀ-Ý]{2,6}\d{0,2})$"
+)
+
+PADRAO_CARGA = re.compile(r"(\d{1,3})\s*h?\s+(\d{1,3})\s*h?\b", re.IGNORECASE)
+
+ROMANOS = {
+    "I": 1, "II": 2, "III": 3, "IV": 4, "V": 5, "VI": 6, "VII": 7,
+    "VIII": 8, "IX": 9, "X": 10,
+}
 
 
 def normalizar(texto: str) -> str:
@@ -45,6 +67,7 @@ def rotulo_da_linha(texto: str) -> str | None:
                 if not resto or not resto[0].isalpha():
                     return nome
     return None
+
 
 def _chave_contagem(linha: str) -> str:
     return re.sub(r"\d+", "#", normalizar(linha))
@@ -97,6 +120,13 @@ class Linha:
     distancia_rotulo: int | None
 
 
+@dataclass
+class Bloco:
+    pagina_inicio: int
+    pagina_fim: int
+    linhas: list[Linha]
+
+
 def extrair_linhas(paginas: list[tuple[int, str]], janela: int = 3) -> list[Linha]:
     brutas: list[tuple[int, int, str]] = []
     for numero, texto in paginas:
@@ -127,6 +157,226 @@ def extrair_linhas(paginas: list[tuple[int, str]], janela: int = 3) -> list[Linh
             )
         )
     return linhas
+
+
+def detectar_delimitador(linhas: list[Linha], minimo: int = 3) -> str | None:
+    contador: Counter[str] = Counter()
+    primeira_ocorrencia: dict[str, int] = {}
+    for i, linha in enumerate(linhas):
+        chave = _chave_contagem(linha.texto)
+        contador[chave] += 1
+        primeira_ocorrencia.setdefault(chave, i)
+
+    if not contador:
+        return None
+
+    maximo = max(contador.values())
+    if maximo < minimo:
+        return None
+
+    candidatas = sorted(
+        (chave for chave, n in contador.items() if n == maximo),
+        key=lambda c: primeira_ocorrencia[c],
+    )
+    return candidatas[0]
+
+
+def segmentar(linhas: list[Linha]) -> list[Bloco]:
+    delimitador = detectar_delimitador(linhas)
+    if delimitador is None:
+        if not linhas:
+            return []
+        return [Bloco(linhas[0].pagina, linhas[-1].pagina, linhas)]
+
+    blocos: list[Bloco] = []
+    atual: list[Linha] = []
+    for linha in linhas:
+        if _chave_contagem(linha.texto) == delimitador:
+            if atual:
+                blocos.append(Bloco(atual[0].pagina, atual[-1].pagina, atual))
+            atual = []
+            continue
+        atual.append(linha)
+    if atual:
+        blocos.append(Bloco(atual[0].pagina, atual[-1].pagina, atual))
+    return blocos
+
+
+def localizar_anexos(paginas: list[tuple[int, str]]) -> list[tuple[int, int]]:
+    marcos = []
+    for numero, texto in paginas:
+        achado = PADRAO_ANEXO.search(texto)
+        if achado:
+            valor = achado.group(1).upper()
+            anexo = ROMANOS.get(valor) or (int(valor) if valor.isdigit() else None)
+            if anexo is not None:
+                marcos.append((numero, anexo))
+    return marcos
+
+
+def periodo_do_bloco(bloco: Bloco, marcos: list[tuple[int, int]]) -> int | None:
+    periodo = None
+    for pagina_marco, anexo in marcos:
+        if pagina_marco <= bloco.pagina_inicio:
+            periodo = anexo
+        else:
+            break
+    return periodo
+
+
+def _indice_rotulo(bloco: Bloco, rotulo: str) -> int | None:
+    for i, linha in enumerate(bloco.linhas):
+        if rotulo_da_linha(linha.texto) == rotulo:
+            return i
+    return None
+
+
+def _indice_contendo(bloco: Bloco, termo: str, limite: int | None = None) -> int | None:
+    linhas = bloco.linhas if limite is None else bloco.linhas[:limite]
+    for i, linha in enumerate(linhas):
+        if termo in normalizar(linha.texto):
+            return i
+    return None
+
+
+def _texto_apos(bloco: Bloco, indice_rotulo: int, proximos_rotulos: set[str]) -> str:
+    partes = []
+    linha_rotulo = bloco.linhas[indice_rotulo].texto
+    if ":" in linha_rotulo:
+        _, resto = linha_rotulo.split(":", 1)
+        resto = resto.strip()
+        if resto:
+            partes.append(resto)
+
+    for linha in bloco.linhas[indice_rotulo + 1:]:
+        if rotulo_da_linha(linha.texto) in proximos_rotulos:
+            break
+        partes.append(linha.texto)
+    return " ".join(partes).strip()
+
+
+def _carga_e_prereq(bloco: Bloco, idx_carga: int) -> tuple[int | None, int | None, int | None, str]:
+    textos = []
+    for linha in bloco.linhas[idx_carga + 1: idx_carga + 8]:
+        if rotulo_da_linha(linha.texto):
+            break
+        textos.append(linha.texto.strip())
+    bruto = " ".join(textos)
+
+    achado = PADRAO_CARGA.search(bruto)
+    if not achado:
+        return None, None, None, bruto.strip()
+
+    teorica, pratica = int(achado.group(1)), int(achado.group(2))
+    antes = bruto[:achado.start()]
+    depois = bruto[achado.end():]
+
+    antes = re.sub(r"(?i)\bte[oó]rica\b", "", antes)
+    antes = re.sub(r"(?i)\bpr[aá]tica\b", "", antes)
+    prereq = (antes.strip() + " " + depois.strip()).strip(" .:-")
+
+    return teorica, pratica, teorica + pratica, prereq
+
+
+def extrair_campos(bloco: Bloco) -> dict:
+    avisos: list[str] = []
+    campos: dict = {
+        "pagina_inicio": bloco.pagina_inicio,
+        "pagina_fim": bloco.pagina_fim,
+        "periodo": None,
+        "disciplina": None,
+        "codigo": None,
+        "carga_teorica": None,
+        "carga_pratica": None,
+        "carga_total": None,
+        "prerequisito": "",
+        "ementa": "",
+        "objetivo": "",
+        "avisos": avisos,
+    }
+
+    idx_ementa = _indice_rotulo(bloco, "ementa")
+
+    idx_cab = _indice_contendo(bloco, "disciplina", limite=idx_ementa)
+    if idx_cab is not None and idx_cab + 1 < len(bloco.linhas):
+        valor = bloco.linhas[idx_cab + 1].texto.strip()
+        achado = PADRAO_VALOR_DISCIPLINA.match(valor)
+        if not achado and idx_cab + 2 < len(bloco.linhas):
+            valor2 = f"{valor} {bloco.linhas[idx_cab + 2].texto.strip()}"
+            achado2 = PADRAO_VALOR_DISCIPLINA.match(valor2)
+            if achado2:
+                valor, achado = valor2, achado2
+        if achado:
+            periodo, nome, codigo = achado.groups()
+            campos["periodo"] = int(periodo) if periodo else None
+            campos["disciplina"] = nome.strip()
+            campos["codigo"] = codigo
+        else:
+            campos["disciplina"] = valor or None
+            avisos.append("nome/codigo nao separados")
+    else:
+        avisos.append("sem cabecalho disciplina")
+
+    idx_carga = _indice_contendo(bloco, "carga horaria", limite=idx_ementa)
+    if idx_carga is not None:
+        teorica, pratica, total, prereq = _carga_e_prereq(bloco, idx_carga)
+        campos["carga_teorica"] = teorica
+        campos["carga_pratica"] = pratica
+        campos["carga_total"] = total
+        campos["prerequisito"] = prereq
+    if campos["carga_total"] is None:
+        avisos.append("sem carga horaria")
+
+    for rotulo in ("ementa", "objetivo"):
+        idx = _indice_rotulo(bloco, rotulo)
+        if idx is not None:
+            campos[rotulo] = _texto_apos(bloco, idx, TODOS_ROTULOS - {rotulo})
+        else:
+            avisos.append(f"sem rotulo {rotulo}")
+
+    return campos
+
+
+def pontuar(campos: dict) -> float:
+    pontos = 0.0
+    if campos.get("disciplina"):
+        pontos += 0.25
+    if campos.get("codigo"):
+        pontos += 0.10
+    if campos.get("ementa") and len(campos["ementa"]) > 20:
+        pontos += 0.30
+    if campos.get("objetivo") and len(campos["objetivo"]) > 10:
+        pontos += 0.20
+    if campos.get("carga_total"):
+        pontos += 0.15
+    return round(pontos, 2)
+
+
+def extrair_ppc(caminho_pdf: str) -> pd.DataFrame:
+    paginas_brutas = ler_paginas(caminho_pdf)
+    marcos_anexo = localizar_anexos(paginas_brutas)
+
+    paginas = [(n, desfazer_hifenizacao(t)) for n, t in paginas_brutas]
+    paginas, _ = remover_repetidas(paginas)
+    linhas = extrair_linhas(paginas)
+    blocos = segmentar(linhas)
+
+    registros = []
+    for bloco in blocos:
+        if len(bloco.linhas) > 150:
+            continue
+        campos = extrair_campos(bloco)
+        nome = campos["disciplina"]
+        if not nome or len(nome) > 80:
+            continue
+        if not campos["ementa"] and not campos["objetivo"]:
+            continue
+        if campos["periodo"] is None:
+            campos["periodo"] = periodo_do_bloco(bloco, marcos_anexo)
+        campos["confianca"] = pontuar(campos)
+        registros.append(campos)
+
+    return pd.DataFrame(registros)
 
 
 def diagnosticar(
@@ -163,9 +413,7 @@ def diagnosticar(
         selecao = [l for l in selecao if l.pagina <= pagina_fim]
     if so_candidatas:
         selecao = [
-            l
-            for l in selecao
-            if l.maiuscula and l.comprimento <= limite_comprimento
+            l for l in selecao if l.maiuscula and l.comprimento <= limite_comprimento
         ]
 
     print(f"\n{'pág':>4} {'nº':>3} {'MAI':>4} {'len':>4} {'rótulo':<14} texto")
